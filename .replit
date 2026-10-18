@@ -6,6 +6,10 @@ channel = "stable-25_05"
 [agent]
 expertMode = true
 
+[deployment]
+run = ["python3", "bot.py"]
+deploymentTarget = "cloudrun"
+
 [workflows]
 
 [[workflows.workflow]]
@@ -16,6 +20,12 @@ author = 25406977
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "PORT=5000 python -u bot.py"
+
+[[ports]]
+localPort = 3001
+
+[[ports]]
+localPort = 4000
 
 [[ports]]
 localPort = 5000
