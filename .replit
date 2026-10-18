@@ -21,3 +21,10 @@ author = 25406977
 task = "shell.exec"
 args = "python -u bot.py"
 
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+[[ports]]
+localPort = 10000
+externalPort = 3000
