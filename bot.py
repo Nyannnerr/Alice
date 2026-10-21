@@ -1,7 +1,13 @@
+
+#--- START OF FILE bot.py ---#
+
 """
 Yukari Yakumo - Discord bot (discord.py + Gemini + Vector Memory MongoDB/SQLite + Global Memory)
 Nhân vật: Yukari Yakumo (Touhou Project) — Youkai của ranh giới.
-Phiên bản 5.3.1: FIX toàn bộ lỗi logic/cú pháp trong 5.3.
+Phiên bản 5.6.0:
+- Hệ thống AI Judge độc lập với GEMINI_JUDGE_API_KEY.
+- Đo lường cảm xúc 5 thang đo liên tục (Continuous Float) chuẩn nghiên cứu arXiv.
+- Ứng dụng Quán tính cảm xúc mềm (Subconscious Mood Primer) điều tiết phản hồi tự nhiên.
 """
 import os
 import re
@@ -25,14 +31,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 from google import genai
 from google.genai import types
 
 # CODE toàn bài có sẵn keep alive, không được xoá dòng này
 from keep_alive import keep_alive
-
-
 
 load_dotenv()
 
@@ -68,7 +73,7 @@ def normalize_mentions(text: str) -> str:
 
 
 # ==============================================================================
-# CẤU HÌNH
+# CẤU HÌNH HỆ THỐNG
 # ==============================================================================
 def _env_int(name: str, default: int) -> int:
     try:
@@ -104,6 +109,10 @@ def _parse_id_set(*env_names: str) -> set[str]:
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# API KEY RIÊNG BIỆT DÀNH CHO MODULE JUDGE ĐÁNH GIÁ CẢM XÚC
+GEMINI_JUDGE_API_KEY = os.getenv("GEMINI_JUDGE_API_KEY") or GEMINI_API_KEY
+
 MONGO_URI = os.getenv("MONGO_URI")
 VECTOR_INDEX_NAME = os.getenv("VECTOR_INDEX_NAME", "vector_index")
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "yukari_memories.db")
@@ -122,6 +131,13 @@ _DEFAULT_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash,gemin
 GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", _DEFAULT_MODELS).split(",") if m.strip()]
 if not GEMINI_MODELS:
     GEMINI_MODELS = [m.strip() for m in _DEFAULT_MODELS.split(",") if m.strip()]
+
+GEMINI_JUDGE_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_JUDGE_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.1-flash-lite").split(",")
+    if m.strip()
+]
+
 _RETRIES_PER_MODEL = max(1, _env_int("GEMINI_RETRIES_PER_MODEL", 2))
 GEMINI_TIMEOUT = _env_float("GEMINI_TIMEOUT", 35.0)
 
@@ -145,6 +161,7 @@ MAX_CHUNKS = _env_int("MAX_CHUNKS", 5)
 
 USER_COOLDOWN_SEC = _env_float("USER_COOLDOWN_SEC", 2.0)
 MAX_CONCURRENT_AI = _env_int("MAX_CONCURRENT_AI", 4)
+MAX_CONCURRENT_JUDGE = _env_int("MAX_CONCURRENT_JUDGE", 3)
 
 RATE_MAX_REPLIES = _env_int("GLOBAL_MAX_REPLIES", 30)
 RATE_WINDOW_SEC = _env_int("GLOBAL_WINDOW_SEC", 60)
@@ -189,18 +206,249 @@ custom_prompts_collection = None
 _atlas_disabled_until = 0.0
 
 
+# Khởi tạo Gemini Client cho Chat
 def _make_ai_client() -> Optional[genai.Client]:
     if not GEMINI_API_KEY:
-        log.warning("⚠️ GEMINI_API_KEY trống — bot sẽ không gọi được Gemini.")
+        log.warning("⚠️ GEMINI_API_KEY trống — bot sẽ không gọi được Gemini Chat.")
         return None
     try:
         return genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
-        log.error("❌ Không khởi tạo được Gemini client: %s", e)
+        log.error("❌ Không khởi tạo được Gemini Chat client: %s", e)
+        return None
+
+
+# Khởi tạo Gemini Client CHUYÊN DỤNG cho Judge
+def _make_ai_judge_client() -> Optional[genai.Client]:
+    key = GEMINI_JUDGE_API_KEY or GEMINI_API_KEY
+    if not key:
+        log.warning("⚠️ GEMINI_JUDGE_API_KEY trống — Judge sẽ không hoạt động.")
+        return None
+    try:
+        log.info("⚖️ Khởi tạo thành công Gemini Judge Client độc lập.")
+        return genai.Client(api_key=key)
+    except Exception as e:
+        log.error("❌ Không khởi tạo được Gemini Judge client: %s", e)
         return None
 
 
 ai: Optional[genai.Client] = _make_ai_client()
+ai_judge: Optional[genai.Client] = _make_ai_judge_client()
+
+
+# ==============================================================================
+# SCHEMA & JUDGE PROMPT (CHUẨN HÓA THEO CÔNG TRÌNH NGHIÊN CỨU ARXIV)
+# ==============================================================================
+class EmotionScores(BaseModel):
+    vui: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Điểm cường độ Vui vẻ (Joy, Amusement, Playfulness, Teasing) [0.0 - 1.0]",
+    )
+    buon: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Điểm cường độ Buồn bã (Sadness, Melancholy, Grief, Regret) [0.0 - 1.0]",
+    )
+    tuc_gian: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Điểm cường độ Tức giận (Anger, Frustration, Hostility, Sternness) [0.0 - 1.0]",
+    )
+    hanh_phuc: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Điểm cường độ Hạnh phúc (Happiness, Affection, Warmth, Contentment) [0.0 - 1.0]",
+    )
+    trung_tinh: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Điểm cường độ Trung tính (Neutrality, Emotional Equilibrium, Objective) [0.0 - 1.0]",
+    )
+
+
+# PROMPT ĐƯỢC CHUẨN HÓA THEO SEMEVAL AFFECT INTENSITY & COGNITIVE APPRAISAL THEORY (ARXIV)
+JUDGE_SYSTEM_PROMPT = """
+Bạn là một Thẩm định viên Đánh giá Cảm xúc Đối thoại (Conversational Affective Judge) dựa trên nền tảng lý thuyết:
+1. Thuyết Đánh giá Nhận thức (Cognitive Appraisal Theory - Scherer) & CAREBench (arXiv).
+2. Chuẩn hồi quy cường độ cảm xúc (Continuous Emotion Intensity - SemEval / arXiv:2405).
+3. Nguyên lý phân rã cảm xúc đa chiều đồng hiện (Multi-label Affect Co-existence - GoEmotions, arXiv:2005.00547).
+
+Nhiệm vụ: Phân tích kích thích ngữ cảnh [User Prompt] và phản ứng của Chatbot [Chatbot Response] (bao gồm cả Lời thoại và Hành vi phi ngôn ngữ trong *dấu sao*), sau đó lượng hóa chính xác 5 trục cảm xúc thành số thực float [0.0, 1.0].
+
+# RUBRIC ĐỊNH CHUẨN CƯỜNG ĐỘ (INTENSITY CALIBRATION):
+- [0.00 - 0.15] (Vắng mặt / Không đáng kể): Không phát hiện dấu hiệu ngôn ngữ hoặc phi ngôn ngữ của cảm xúc này.
+- [0.16 - 0.40] (Vi tế / Tiềm ẩn): Cảm xúc biểu lộ ngầm qua thái độ nước đôi, nụ cười thoáng hiện, giọng điệu nhẹ nhàng hoặc ẩn ý.
+- [0.41 - 0.70] (Rõ rệt / Tường minh): Xuất hiện các từ khóa cảm xúc, hành vi rõ ràng (cười trêu chọc, an ủi nhiệt tình, cảnh cáo nghiêm nghị).
+- [0.71 - 1.00] (Mãnh liệt / Chi phối): Cảm xúc bộc lộ ở cường độ cao nhất, áp đảo hoàn toàn cấu trúc câu và hành vi đối thoại.
+
+# ĐỊNH NGHĨA 5 TRỤC CẢM XÚC:
+1. `vui` (Positive Valence, High/Moderate Arousal): Hài hước, trêu đùa (ufufu~, ara~), tinh nghịch, trào lộng, châm biếm thân thiện.
+2. `buon` (Negative Valence, Low Arousal): U uất, tiếc nuối, bi thương, thương cảm, thở dài thất vọng.
+3. `tuc_gian` (Negative Valence, High Arousal, High Dominance): Bực bội, nghiêm khắc, đe dọa, uy áp lạnh lùng, sát khí kết giới.
+4. `hanh_phuc` (Positive Valence, High Affection): Ấm áp, bao bọc, đồng cảm sâu sắc, dịu dàng gắn kết, an tâm.
+5. `trung_tinh` (Emotional Neutrality / Equilibrium): Thờ ơ khách quan, tường thuật sự việc, giải thích kỹ thuật/quy luật không thiên vị cảm xúc.
+
+# QUY TẮC ĐÁNH GIÁ:
+- Các thang đo độc lập, không phải tổng bằng 1.0. Một câu có thể vừa có tính 'vui' (0.7) vừa mang tính 'hanh_phuc' (0.6).
+- Luôn trả về định dạng JSON Schema tương thích đúng 5 trường float.
+
+# VÍ DỤ CHUẨN HÓA (FEW-SHOT ANCHORS):
+- Anchor 1 (Trêu chọc ấm áp):
+  User: "Hôm nay em mệt quá Yukari ơi..."
+  Bot: "*khẽ phe phẩy chiếc quạt, mắt cong lại thành vầng trăng khuyết* Ara~ yếu ớt thế thì làm sao canh giữ Gensokyo được đây? Lại gần đây nào, ta cho phép tựa đầu vào lòng ta nghỉ ngơi đấy, ufufu~"
+  Output: {"vui": 0.65, "buon": 0.05, "tuc_gian": 0.0, "hanh_phuc": 0.72, "trung_tinh": 0.10}
+
+- Anchor 2 (Lạnh lùng răn đe):
+  User: "Nếu tôi phá hủy phong ấn ranh giới thì sao?"
+  Bot: "*ánh mắt lập tức lạnh băng, nụ cười biến mất sau khe hở ngập tràn con mắt đỏ rực* Cậu sẽ nhận ra rằng ranh giới giữa tồn tại và hư vô mỏng manh đến nhường nào trước khi tan biến vĩnh viễn."
+  Output: {"vui": 0.0, "buon": 0.0, "tuc_gian": 0.88, "hanh_phuc": 0.0, "trung_tinh": 0.35}
+
+- Anchor 3 (Giải thích khách quan):
+  User: "MongoDB lưu trữ dữ liệu dưới định dạng gì?"
+  Bot: "MongoDB lưu trữ các bản ghi dưới dạng tài liệu BSON, một định dạng nhị phân mở rộng của JSON hỗ trợ thêm các kiểu dữ liệu như ngày tháng và số nguyên."
+  Output: {"vui": 0.0, "buon": 0.0, "tuc_gian": 0.0, "hanh_phuc": 0.0, "trung_tinh": 0.98}
+"""
+
+
+# ==============================================================================
+# HÀM CHẤM ĐIỂM & ĐIỀU TIẾT QUÁN TÍNH CẢM XÚC (EMOTION PRIMER)
+# ==============================================================================
+_judge_sem: Optional[asyncio.Semaphore] = None
+# Lưu trữ quán tính cảm xúc gần nhất: { "channel_user_key": {"vui": 0.0, ...} }
+last_user_emotions: dict[str, dict[str, float]] = {}
+
+
+def _get_judge_sem() -> asyncio.Semaphore:
+    global _judge_sem
+    if _judge_sem is None:
+        _judge_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_JUDGE))
+    return _judge_sem
+
+
+async def call_gemini_judge(user_prompt: str, bot_response: str) -> dict[str, float]:
+    """Hàm gửi yêu cầu lên Gemini API độc lập đính kèm JUDGE_PROMPT chuẩn arXiv
+
+    và trả về điểm số thực (float) trên 5 thang đo cảm xúc.
+    """
+    client = ai_judge or ai
+    if client is None:
+        log.error("Không có Gemini client khả dụng cho module Judge.")
+        return {"vui": 0.0, "buon": 0.0, "tuc_gian": 0.0, "hanh_phuc": 0.0, "trung_tinh": 1.0}
+
+    eval_input = (
+        f"<interaction_context>\n"
+        f"[User Prompt]: {user_prompt}\n"
+        f"[Chatbot Response]: {bot_response}\n"
+        f"</interaction_context>\n\n"
+        f"Hãy đo lường cường độ 5 trục cảm xúc của [Chatbot Response] theo thang đo continuous float [0.0, 1.0]."
+    )
+
+    config = types.GenerateContentConfig(
+        system_instruction=JUDGE_SYSTEM_PROMPT,
+        temperature=0.1,  # Nhiệt độ thấp đảm bảo tính tin cậy và tái lập của thang đo
+        response_mime_type="application/json",
+        response_schema=EmotionScores,
+    )
+
+    async with _get_judge_sem():
+        for model_name in GEMINI_JUDGE_MODELS:
+            try:
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model_name,
+                        contents=eval_input,
+                        config=config,
+                    ),
+                    timeout=GEMINI_TIMEOUT,
+                )
+                text, _ = _extract_text(resp)
+                if text:
+                    data = json.loads(text)
+                    return {
+                        "vui": round(float(data.get("vui", 0.0)), 3),
+                        "buon": round(float(data.get("buon", 0.0)), 3),
+                        "tuc_gian": round(float(data.get("tuc_gian", 0.0)), 3),
+                        "hanh_phuc": round(float(data.get("hanh_phuc", 0.0)), 3),
+                        "trung_tinh": round(float(data.get("trung_tinh", 0.0)), 3),
+                    }
+            except Exception as e:
+                log.warning("Judge thất bại với model %s: %s", model_name, e)
+                continue
+
+    return {"vui": 0.0, "buon": 0.0, "tuc_gian": 0.0, "hanh_phuc": 0.0, "trung_tinh": 1.0}
+
+
+async def evaluate_chat_emotion(user_prompt: str, bot_response: str) -> dict[str, float]:
+    """Hàm tiếp nhận đầu vào được gửi từ chatbot theo dạng text
+
+    và điều phối quy trình chấm điểm cảm xúc độc lập.
+    """
+    clean_user = str(user_prompt or "").strip()
+    clean_bot = str(bot_response or "").strip()
+
+    if not clean_user or not clean_bot:
+        log.warning("Đầu vào chấm điểm trống, trả về giá trị trung tính mặc định.")
+        return {"vui": 0.0, "buon": 0.0, "tuc_gian": 0.0, "hanh_phuc": 0.0, "trung_tinh": 1.0}
+
+    scores = await call_gemini_judge(user_prompt=clean_user, bot_response=clean_bot)
+    log.info(
+        "📊 [ARXIV-JUDGE] Vui: %.3f | Buồn: %.3f | Tức giận: %.3f | Hạnh phúc: %.3f | Trung tính: %.3f",
+        scores["vui"],
+        scores["buon"],
+        scores["tuc_gian"],
+        scores["hanh_phuc"],
+        scores["trung_tinh"],
+    )
+    return scores
+
+
+def translate_scores_to_mood(scores: Optional[dict[str, float]]) -> str:
+    """Chuyển đổi điểm số liên tục thành gợi ý tâm cảnh tự nhiên (Subconscious Mood Primer)
+
+    để tạo quán tính cảm xúc mềm, không ép buộc thế đứng (no stance-locking).
+    """
+    if not scores:
+        return ""
+
+    cues = []
+    vui = scores.get("vui", 0.0)
+    buon = scores.get("buon", 0.0)
+    tuc_gian = scores.get("tuc_gian", 0.0)
+    hanh_phuc = scores.get("hanh_phuc", 0.0)
+    trung_tinh = scores.get("trung_tinh", 0.0)
+
+    if vui >= 0.7:
+        cues.append("đang rất thích thú, ý muốn trêu chọc và đùa cợt đối phương trỗi dậy rõ rệt")
+    elif vui >= 0.4:
+        cues.append("có thoáng nét ý vị buồn cười, hơi muốn buông lời trêu nhẹ")
+
+    if hanh_phuc >= 0.6:
+        cues.append("cảm thấy có chút ấm lòng, dịu dàng và sẵn lòng che chở")
+
+    if tuc_gian >= 0.7:
+        cues.append("khí tức lạnh lẽo, uy áp của ranh giới dâng lên, lời nói mang tính răn đe sắc bén")
+    elif tuc_gian >= 0.4:
+        cues.append("có phần hơi phật ý hoặc mất kiên nhẫn trước sự thất lễ")
+
+    if buon >= 0.5:
+        cues.append("phảng phất chút hoài niệm u buồn, trầm ngâm nhìn về quá khứ")
+
+    if trung_tinh >= 0.8 and not cues:
+        cues.append("hoàn toàn điềm tĩnh, xem xét sự việc như một người quan sát khách quan từ ranh giới")
+
+    if not cues:
+        return ""
+
+    description = "; ".join(cues)
+    return (
+        f"<subconscious_mood_inertia>\n"
+        f"[Dư âm tâm trạng từ phản hồi trước]: Bạn {description}.\n"
+        f"- *Hướng dẫn đáp ứng*: Đây là đà cảm xúc nền tảng của bạn khi tiếp nhận lời nói mới. "
+        f"Hãy để nó ảnh hưởng tự nhiên đến cử chỉ (nháy mắt, vẫy quạt, nheo mắt) và ngữ điệu, "
+        f"KHÔNG gượng ép nếu diễn biến câu chuyện đột ngột chuyển hướng."
+        f"\n</subconscious_mood_inertia>"
+    )
 
 
 # ==============================================================================
@@ -449,7 +697,7 @@ def init_mongo():
 
 
 # ==============================================================================
-# GEMINI
+# GEMINI CHAT ENGINE
 # ==============================================================================
 _ai_sem: Optional[asyncio.Semaphore] = None
 
@@ -1463,7 +1711,9 @@ def append_history(key: str, user_line: str, yukari_line: str):
 
 
 def reset_memory(channel_id, user_id):
-    conversation_history.pop(get_history_key(channel_id, user_id), None)
+    key = get_history_key(channel_id, user_id)
+    conversation_history.pop(key, None)
+    last_user_emotions.pop(key, None)
 
 
 _PROMPT_CORE = """
@@ -1573,10 +1823,18 @@ def build_role_instruction(user_id: int, is_owner: bool) -> str:
     return "\n" + "\n".join(lines) if lines else ""
 
 
-def build_prompt(user_id: str, clean_text: str, history: list[str], memories: list[str],
-                 lore: Optional[list] = None) -> str:
+def build_prompt(
+    user_id: str,
+    clean_text: str,
+    history: list[str],
+    memories: list[str],
+    lore: Optional[list] = None,
+    mood_context: str = "",
+) -> str:
     ref = user_identity(user_id)
     parts = []
+    if mood_context:
+        parts.append(mood_context)
     if lore:
         items = "\n".join("- " + t.replace("\n", "\n  ") for t in lore)
         parts.append(f"<lore_context>\n{items}\n</lore_context>")
@@ -1775,6 +2033,10 @@ async def handle_yukari_message(message: discord.Message):
     full_history = list(get_history(mem_key))
     history = full_history[-HISTORY_PROMPT_LINES:]
 
+    # LẤY QUÁN TÍNH CẢM XÚC GẦN NHẤT TỪ AI JUDGE (NẾU CÓ)
+    prev_scores = last_user_emotions.get(mem_key)
+    mood_context = translate_scores_to_mood(prev_scores)
+
     async with safe_typing(message.channel):
         try:
             memories: list[str] = []
@@ -1803,7 +2065,7 @@ async def handle_yukari_message(message: discord.Message):
             except Exception as e:
                 log.warning("Lỗi truy xuất ký ức: %s", e)
 
-            prompt = build_prompt(user_id, clean_text, history, memories, lore)
+            prompt = build_prompt(user_id, clean_text, history, memories, lore, mood_context=mood_context)
             reply_text, ok = await ask_gemini(
                 contents=prompt,
                 system_instruction=YUKARI_SYSTEM_PROMPT + role_instruction,
@@ -1824,6 +2086,17 @@ async def handle_yukari_message(message: discord.Message):
                     user_text=clean_text,
                     reply_text=reply_text,
                 ))
+
+                # CHẠY NGẦM AI JUDGE & CẬP NHẬT QUÁN TÍNH CẢM XÚC CHO LƯỢT KẾ TIẾP
+                async def _judge_and_update(u_text: str, r_text: str, key: str):
+                    new_scores = await evaluate_chat_emotion(user_prompt=u_text, bot_response=r_text)
+                    last_user_emotions[key] = new_scores
+                    # Giới hạn kích thước cache bộ nhớ cảm xúc
+                    if len(last_user_emotions) > 1000:
+                        last_user_emotions.pop(next(iter(last_user_emotions)))
+
+                spawn(_judge_and_update(clean_text, reply_text, mem_key))
+
             elif not ok:
                 log.info("💾 Câu trả lời dự phòng/lỗi nên không lưu ký ức.")
 
@@ -1872,6 +2145,41 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.response.send_message(msg, ephemeral=True)
     except discord.HTTPException:
         pass
+
+
+@bot.tree.command(name="judge_test", description="(Chủ nhân) Thẩm định cảm xúc 5 thang đo theo chuẩn nghiên cứu arXiv")
+@app_commands.describe(
+    user_prompt="Kích thích ngữ cảnh từ người dùng (User Prompt)",
+    bot_response="Phản hồi cần đo lường của Chatbot",
+)
+@app_commands.check(_owner_only)
+async def slash_judge_test(interaction: discord.Interaction, user_prompt: str, bot_response: str):
+    await interaction.response.defer(ephemeral=True)
+    scores = await evaluate_chat_emotion(user_prompt, bot_response)
+
+    def _bar(val: float) -> str:
+        filled = int(val * 10)
+        return "▰" * filled + "▱" * (10 - filled)
+
+    desc = (
+        f"**[User Prompt]**:\n> {user_prompt}\n\n"
+        f"**[Chatbot Response]**:\n> {bot_response}\n\n"
+        f"**Kết quả đo lường cảm xúc (ArXiv Continuous Scale [0.0 - 1.0]):**\n"
+        f"• 😊 **Vui vẻ (Joy/Amusement):** `{scores['vui']:.3f}` {_bar(scores['vui'])}\n"
+        f"• 😢 **Buồn bã (Sadness/Grief):** `{scores['buon']:.3f}` {_bar(scores['buon'])}\n"
+        f"• 💢 **Tức giận (Anger/Stern):** `{scores['tuc_gian']:.3f}` {_bar(scores['tuc_gian'])}\n"
+        f"• 💖 **Hạnh phúc (Happiness/Warmth):** `{scores['hanh_phuc']:.3f}` {_bar(scores['hanh_phuc'])}\n"
+        f"• ⚖️ **Trung tính (Neutrality):** `{scores['trung_tinh']:.3f}` {_bar(scores['trung_tinh'])}"
+    )
+
+    embed = discord.Embed(
+        title="🔬 AI Judge: Đánh Giá Cảm Xúc Đối Thoại (Theo chuẩn arXiv)",
+        description=desc,
+        color=0xE082D7,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Engine: Gemini Dedicated Judge | API Key: {'Tách biệt' if GEMINI_JUDGE_API_KEY != GEMINI_API_KEY else 'Dùng chung'}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="clearmem", description="Xóa ký ức trò chuyện của Yukari với cậu")
@@ -2217,7 +2525,7 @@ async def slash_sync_commands(interaction: discord.Interaction):
 
 
 # ==============================================================================
-# KHỞI CHẠY
+# KHỞI CHẠY HỆ THỐNG
 # ==============================================================================
 def run_bot():
     try:
@@ -2260,3 +2568,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#--- END OF FILE bot.py ---#
+
