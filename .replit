@@ -21,6 +21,15 @@ author = 25406977
 task = "shell.exec"
 args = "python -u bot.py"
 
+[[workflows.workflow]]
+name = "update"
+mode = "sequential"
+author = 25406977
+
+[[workflows.workflow.tasks]]
+task = "packager.installForLanguage"
+args = "python3"
+
 [[ports]]
 localPort = 8080
 externalPort = 80

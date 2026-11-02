@@ -4,3 +4,6 @@ python-dotenv>=1.0.0
 pymongo[srv]
 sift-stack-py
 Flask
+aiohttp
+certifi
+anyio
